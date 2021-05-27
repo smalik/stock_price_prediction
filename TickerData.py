@@ -56,6 +56,8 @@ class TickerBase(object):
                  engine=None):
 
         self.df = pd.DataFrame()
+        self.daily = pd.DataFrame()
+        self.intraday = pd.DataFrame()
         self.target = None
         self.start = start,
         self.end = end,
@@ -146,27 +148,77 @@ class TickerBase(object):
                                      token=self.token)
         self.df = prices
 
-    def update_daily_db_prices(self, update_type:str = 'append'):
+    def update_daily_db_prices(self, update_type:str = 'append', ticker_override= None):
+        if ticker_override is None:
+            ticker = self.ticker
+        else:
+            ticker = ticker_override
+        print(f'Ticker now set to {ticker}')
+
+
         if self.token is None:
             self.set_api_token()
-        print(self.token)
-        query = f'select max(timestamp) from {self.ticker.lower()}_price_daily'
-        last_date = pd.read_sql(query, con=self.con)
-        print(last_date)
-        month = pd.DatetimeIndex(last_date.values[0]).month.astype(int)[0]
-        day = pd.DatetimeIndex(last_date.values[0]).day.astype(int)[0]
-        year = pd.DatetimeIndex(last_date.values[0]).year.astype(int)[0]
-        print(year, month, day)
-        ref_time = datetime(year, month, day)
-        print(ref_time)
-        prices = get_historical_data(self.ticker,
-                                     ref_time,
-                                     self.end[0],
-                                     close_only=False,
-                                     output_format='pandas',
-                                     token=self.token)
-        print(prices)
-        prices.to_sql(f'{self.ticker.lower()}_price_daily', con=self.con, if_exists=update_type, index_label='timestamp')
+
+        try:
+            query = f'select max(timestamp) from {self.ticker.lower()}_price_daily'
+            last_date = pd.read_sql(query, con=self.con)
+            rowcount = pd.read_sql(f'select count(*) from {self.ticker.lower()}_price_daily', con=self.con)
+            if np.max(rowcount).values == 0:
+                month = pd.DatetimeIndex(last_date.values[0]).month.astype(int)[0]
+                day = pd.DatetimeIndex(last_date.values[0]).day.astype(int)[0] + 1
+                year = pd.DatetimeIndex(last_date.values[0]).year.astype(int)[0]
+                ref_time = datetime(year, month, day)
+                prices = get_historical_data(ticker,
+                                             ref_time,
+                                             self.end[0],
+                                             close_only=False,
+                                             output_format='pandas',
+                                             token=self.token)
+            else:
+                #if ref_time.date() >= datetime.datetime.today().date():
+                    #ref_time = datetime.now() - timedelta(days=15 * 365)
+                update_type = 'replace'
+                ref_time = datetime.now() - timedelta(days=15 * 365)
+                prices = get_historical_data(ticker,
+                                             ref_time,
+                                             self.end[0],
+                                             close_only=False,
+                                             output_format='pandas',
+                                             token=self.token)
+        except Exception as e:
+            print(e)
+            update_type = 'replace'
+            ref_time = datetime.now() - timedelta(days=15*365)
+            prices = get_historical_data(ticker,
+                                         ref_time,
+                                         self.end[0],
+                                         close_only=False,
+                                         output_format='pandas',
+                                         token=self.token)
+        print(f'Writing to table {ticker.lower()}_price_daily')
+
+        prices.to_sql(f'{ticker.lower()}_price_daily', con=self.con, if_exists=update_type, index_label='timestamp')
+
+    def update_all_daily_db_prices(self):
+        query_tblnames = ''' 
+        SELECT table_name
+        FROM information_schema.tables
+        WHERE table_schema = 'public'
+        ORDER BY table_name;
+        '''
+
+        tbls = pd.read_sql(query_tblnames, self.con)
+
+        tickers = [ticker.split('_')[0].upper() for ticker in tbls.table_name]
+        print(tickers)
+
+        for ticker in tickers:
+            try:
+                print(f'Updating daily price table for : {ticker}...')
+                self.update_daily_db_prices(ticker_override= ticker)
+                print(f'{ticker} prices updated.')
+            except Exception as e:
+                print(e)
 
     def getIntradayPrices(self, date, stock='QQQ'):
         prices = get_historical_intraday(stock,
@@ -206,21 +258,58 @@ class TickerBase(object):
     def fetch_intraday_prices_db(self, value: str = 'all', interval: str = '30T', aggfunc= np.mean):
         query = f'select * from {self.ticker.lower()}_price_intraday'
         data = pd.read_sql(query, con= self.con, index_col='timestamp')
-        data.rename(columns={'close': 'adjclose'})
+        data.rename(columns={'close': 'adjclose'}, inplace= True)
         pdata = data.sort_index()
         if value != 'all':
             pdata = pdata[value].resample(interval).apply(aggfunc).dropna()
 
         else:
             pdata = pdata.resample(interval).apply(aggfunc).dropna()
+
+        pdata['close'] = pdata.adjclose.copy()
+
         self.df = pdata
+        self.intraday = pdata
+
         return pdata
 
-    def fetch_daily_ticker_db(self, ticker):
+    def fetch_daily_ticker_db(self, ticker=None):
+        if ticker is None:
+            ticker = self.ticker
+        else:
+            ticker = ticker
+
         engine = create_engine(('postgresql://plytos:plytos1@192.168.1.7:5432/stockdb'))
 
         query= f'select * from {ticker.lower()}_price_daily'
-        self.df = pd.read_sql(query, con=engine, index_col='timestamp')
+        data = pd.read_sql(query, con=engine, index_col='timestamp')
+
+        convert_dict = dict()
+        convert_dict['close'] = float
+        convert_dict['high'] = float
+        convert_dict['low'] = float
+        convert_dict['open'] = float
+        convert_dict['volume'] = float
+        convert_dict['changeOverTime'] = float
+        convert_dict['marketChangeOverTime'] = float
+        convert_dict['uClose'] = float
+        convert_dict['uOpen'] = float
+        convert_dict['uHigh'] = float
+        convert_dict['uLow'] = float
+        convert_dict['uVolume'] = float
+        convert_dict['fClose'] = float
+        convert_dict['fOpen'] = float
+        convert_dict['fHigh'] = float
+        convert_dict['fLow'] = float
+        convert_dict['fVolume'] = float
+        convert_dict['change'] = float
+        convert_dict['changePercent'] = float
+        data = data.astype(convert_dict)
+        data['adjclose'] = data.close.copy()
+
+        self.data = data
+        self.daily = data
+
 
     def fetch_ticker_data(self, ticker: str = None) -> pd.DataFrame:
         if isinstance(ticker, str):
@@ -308,6 +397,7 @@ class TickerBase(object):
         high = df.high
         low = df.low
         volume = df.volume
+        adjclose = close
 
         nan_offset = 50
 
@@ -331,12 +421,18 @@ class TickerBase(object):
         df['psar_005'] = self.get_sar(high, low, 0.005, 0.2)
         df['psar_02'] = self.get_sar(high, low, 0.02, 0.2)
         df['psar_1'] = self.get_sar(high, low, 0.1, 0.2)
-        df['psar_005_dist'] = df.psar_005 - df.adjclose
-        df['psar_02_dist'] = df.psar_02 - df.adjclose
-        df['psar_1_dist'] = df.psar_1 - df.adjclose
-        df['psar_005_ind'] = (df.psar_005 < self.df.adjclose).astype(int)
-        df['psar_02_ind'] = (df.psar_02 < self.df.adjclose).astype(int)
-        df['psar_1_ind'] = (df.psar_1 < self.df.adjclose).astype(int)
+        try:
+            df['psar_005_dist'] = df.psar_005 - df.adjclose
+            df['psar_02_dist'] = df.psar_02 - df.adjclose
+            df['psar_1_dist'] = df.psar_1 - df.adjclose
+        except Exception as e:
+            print(e)
+        try:
+            df['psar_005_ind'] = (df.psar_005 < self.df.adjclose).astype(int)
+            df['psar_02_ind'] = (df.psar_02 < self.df.adjclose).astype(int)
+            df['psar_1_ind'] = (df.psar_1 < self.df.adjclose).astype(int)
+        except Exception as e:
+            print(e)
         df['sma5'] = talib.SMA(close, timeperiod=5)
         df['sma10'] = talib.SMA(close, timeperiod=10)
         df['sma20'] = talib.SMA(close, timeperiod=20)
@@ -374,8 +470,11 @@ class TickerBase(object):
         df['obv'] = talib.OBV(close, volume)
         df['adosc'] = talib.ADOSC(high, low, close, volume, fastperiod=3, slowperiod=10)
         df['ad'] = talib.AD(high, low, close, volume)
-        df['log_return'] = df.ta.log_return()
-        df['percent_return'] = df.ta.percent_return()
+        try:
+            df['log_return'] = df.ta.log_return()
+            df['percent_return'] = df.ta.percent_return()
+        except Exception as e:
+            print(e)
         df['zscore'] = df.ta.zscore()
         df['quantile'] = df.ta.quantile()
         df['ht_dom_per'] = talib.HT_DCPERIOD(close)
